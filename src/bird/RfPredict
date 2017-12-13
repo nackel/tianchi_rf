@@ -1,0 +1,304 @@
+package bird;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.apache.commons.lang.StringUtils;
+
+import sky.Util;
+
+import com.aliyun.odps.counter.Counter;
+import com.aliyun.odps.data.Record;
+import com.aliyun.odps.data.TableInfo;
+import com.aliyun.odps.mapred.JobClient;
+import com.aliyun.odps.mapred.MapperBase;
+import com.aliyun.odps.mapred.ReducerBase;
+import com.aliyun.odps.mapred.RunningJob;
+import com.aliyun.odps.mapred.conf.JobConf;
+import com.aliyun.odps.mapred.utils.InputUtils;
+import com.aliyun.odps.mapred.utils.OutputUtils;
+import com.aliyun.odps.mapred.utils.SchemaUtils;
+
+/*
+ * 预加载训练好的模型，预测结果
+ */
+public class RfPredict {
+
+	public static class TokenizerMapper extends MapperBase {
+
+		Record key;
+		Record value;
+
+		@Override
+		public void setup(TaskContext context) throws IOException {
+		}
+
+		@Override
+		public void map(long recordNum, Record record, TaskContext context)
+				throws IOException {
+			String tablename = context.getInputTableInfo().getTableName();
+			if (tablename.contains("meta")){
+				String row = record.getString("mall_id");
+				String info = record.getString("info");
+				key = context.createMapOutputKeyRecord();
+				value = context.createMapOutputValueRecord();
+				key.set(new Object[] { row });
+				value.set(new Object[] { "0" + info});
+				context.write(key, value);
+			}else if(tablename.contains("weights")){
+				String row = record.getString("mall_id");
+				String info = record.getString("info");
+				key = context.createMapOutputKeyRecord();
+				value = context.createMapOutputValueRecord();
+				key.set(new Object[] { row });
+				value.set(new Object[] { "1" + info});
+				context.write(key, value);
+			}else{
+				String row = record.getString("mall_id");
+				String shop_id = "s_-1";
+				try{
+					shop_id = record.getString("shop_id");
+				}catch(Exception e){
+					
+				}
+				String row_id = record.getString("row_id");
+				Double lat1 = record.getDouble("latitude");
+				Double lon1 = record.getDouble("longitude");
+				String time = record.getString("time_stamp");
+				SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd hh:mm");
+				String wifiinfo = record.getString("wifi_infos");
+				try {
+					if (sdf.parse(time).getTime() >= sdf.parse(
+							context.getJobConf().get("timesplit")).getTime() &&
+							sdf.parse(time).getTime() < sdf.parse(
+									context.getJobConf().get("timesplit")).getTime() + 14 * 24 * 3600 *1000 ) {
+						key = context.createMapOutputKeyRecord();
+						value = context.createMapOutputValueRecord();
+						key.set(new Object[] { row});
+						value.set(new Object[] { "2" + wifiinfo + "," + time + "," + lon1 + ","
+									+ lat1 + "," + shop_id + "," + row_id});
+						context.write(key, value);
+					}
+				} catch (ParseException e) {
+					e.printStackTrace();
+				}
+			}
+			
+		}
+	}
+
+	/**
+	 * A reducer class that just emits the sum of the input values.
+	 */
+	public static class SumReducer extends ReducerBase {
+		Counter gCntAll;
+		Counter gCntTp;
+
+		@Override
+		public void setup(TaskContext context) throws IOException {
+			gCntAll = context.getCounter("MyCounters", "all_counts");
+			gCntTp = context.getCounter("MyCounters", "tp_counts");
+		}
+
+		@Override
+		public void reduce(Record key, Iterator<Record> values,
+				TaskContext context) throws IOException {
+			String table1 = context.getJobConf().get("t1");
+			SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd hh:mm");
+			List<Map<String,Double>> samples = new ArrayList<Map<String,Double>>();
+			List<String> rowList = new ArrayList<String>();
+			Map<String,Double> connectwifiDef = new HashMap<String,Double>();  // 储存每个wifi被连接时的均值强度
+			Map<String,Integer> wifiEncoder = new HashMap<String,Integer>();
+			List<String> weights = new ArrayList<String>();
+			String mall = key.getString(0);
+			int count = 0;
+			String meta = "";
+			System.out.println("mall:"+mall);
+			while (values.hasNext()) {
+				Record val = values.next();
+				String text = (String) val.get(0);
+				if (text.startsWith("0")){
+					text = text.substring(1);
+					if (meta.length() == 0){
+						meta = text;
+					}else{
+						System.out.println("-------");
+					}
+				}else if(text.startsWith("1")){
+					text = text.substring(1);
+					weights.add(text);
+				}else if(text.startsWith("2")){
+					text = text.substring(1);
+					Map<String,Double> sample = new HashMap<String,Double>();
+					String[] array = text.split(",", -1);
+					int hour;
+					try {
+						Date time = sdf.parse(array[1]);
+						hour = time.getHours();
+						sample.put("hour", (double) hour);
+						for (String wifis : array[0].split(";", -1)) {
+							String wifiname = wifis.split("\\|", -1)[0];
+							if (!wifis.split("\\|", -1)[1].equals("null")) {
+								sample.put(wifiname, Double.valueOf(wifis.split("\\|", -1)[1]));
+							}else{
+								sample.put(wifiname, 100.0);
+							}
+						}
+						sample.put("gps1",Double.valueOf(array[2]));
+						sample.put("gps2",Double.valueOf(array[3]));
+						sample.put("label",Double.valueOf(array[4].split("_")[1]));
+						samples.add(sample);
+						rowList.add(array[5]);
+					} catch (ParseException e) {
+						e.printStackTrace();
+					}
+				}
+			}
+			
+			String [] array = meta.split("#",-1);
+			for (String wifi:array[0].split("\\|",-1)){
+				if (wifi.length() > 0){
+					connectwifiDef.put(wifi.split(",",-1)[0], Double.valueOf(wifi.split(",",-1)[1]));
+				}
+			}
+			
+			//System.out.println(connectwifiDef);
+			int index = 0;
+			for (String wifi:array[1].split("\\|",-1)){
+				if (wifi.length() > 0){
+					wifiEncoder.put(wifi.split(",",-1)[0], Integer.valueOf(wifi.split(",",-1)[1]));
+					index ++;
+				}
+			}
+
+			Rf rf = Rf.load(weights, 150);
+			System.out.println("rf loaded.");
+			List<double[]> samplesDF = new ArrayList<double[]>();
+			for (int j = 0;j<samples.size();j++){
+				Map<String,Double> m = samples.get(j);
+				String row_id = rowList.get(j);
+				double[] row = new double[index];
+				for (int i=0;i<index;i++){
+					row[i] = -120.0; 
+				}
+				for (String featname : m.keySet()){
+					if(wifiEncoder.containsKey(featname)){
+						int pos = wifiEncoder.get(featname);
+						if(m.get(featname) == 100.0 && !featname.equals("label")){
+							if(connectwifiDef.containsKey(featname)){
+								m.put(featname, connectwifiDef.get(featname));
+							}else{
+								m.put(featname, -60.0);
+							}
+						}
+						row[pos] = m.get(featname);
+					}
+				}
+				samplesDF.add(row);
+				List<String> res = rf.predict_probe(samplesDF, 5);
+				if (res.size() > 0){
+					for (String shopAndProbAll : res){
+						for (String shopAndProb : shopAndProbAll.split("\\|",-1)){
+							if (shopAndProb.length() > 0){
+								String shopid = "s_"+Double.valueOf(shopAndProb.split(",",-1)[0]).intValue();
+									if (row[row.length - 1] == Double.valueOf(shopAndProb.split(",",-1)[0]))
+										gCntTp.increment(1);
+									break;
+							}
+						}
+					}
+				}
+				gCntAll.increment(1);
+				if (!table1.equals("bird_rf_result")){
+					for (String shopAndProbAll : res){
+						for (String shopAndProb : shopAndProbAll.split("\\|",-1)){
+							if (shopAndProb.length() > 0){
+								String shopid = "s_"+Double.valueOf(shopAndProb.split(",",-1)[0]).intValue();
+								String prob = shopAndProb.split(",",-1)[1];
+								Record result1 = context.createOutputRecord(table1);
+								result1.set(0, row_id);
+								result1.set(1, shopid);
+								result1.set(2, prob);
+								context.write(result1, table1);
+							}
+						}
+					}
+				}else{
+					String shopid = "s_1";
+					for (String shopAndProbAll : res){
+						for (String shopAndProb : shopAndProbAll.split("\\|",-1)){
+							if (shopAndProb.length() > 0){
+								shopid = "s_"+Double.valueOf(shopAndProb.split(",",-1)[0]).intValue();
+									break;
+							}
+						}
+					}
+					Record result1 = context.createOutputRecord(table1);
+					result1.set(0, row_id);
+					result1.set(1, shopid);
+					context.write(result1, table1);
+				}
+				m.clear();
+				samplesDF.clear();
+			}
+			samples.clear();
+			rf.clear();
+		}
+	}
+
+	public static void main(String[] args) throws Exception {
+		JobConf job = new JobConf();
+		job.set("odps.stage.mapper.num", "8");
+		job.set("odps.stage.reducer.num", "50");
+		job.setMapperClass(TokenizerMapper.class);
+		job.setReducerClass(SumReducer.class);
+		job.setMapOutputKeySchema(SchemaUtils.fromString("row_id:string"));
+		job.setMapOutputValueSchema(SchemaUtils.fromString("value:string"));
+		for (String tablename : args[0].split(",", -1)) {
+			InputUtils.addTable(TableInfo.builder().tableName(tablename)
+					.build(), job);
+			System.out.println(tablename);
+		}
+
+		
+		if (args[1].equals("train1")) {
+			//String t1 = "bird_rf_result_train1_test";
+			String t1 = "bird_rf_result_train1";
+			OutputUtils.addTable(
+					TableInfo.builder()
+							.tableName(t1).label(t1)
+							.build(), job);
+			job.set("t1", t1);
+			job.set("timesplit", "2017-08-18 00:00");
+		} else if (args[1].equals("sub")) {
+			String t1 = "bird_rf_result_sub";
+			OutputUtils.addTable(
+					TableInfo.builder()
+							.tableName(t1).label(t1)
+							.build(), job);
+			job.set("t1", t1);
+			job.set("timesplit", "2017-09-01 00:00");
+		}else {
+			String t1 = "bird_rf_result";
+			OutputUtils.addTable(
+					TableInfo.builder()
+							.tableName(t1).label(t1)
+							.build(), job);
+			job.set("t1", t1);
+			job.set("timesplit", "2017-09-01 00:00");
+		}
+		RunningJob rj = JobClient.runJob(job);
+		rj.waitForCompletion();
+	}
+
+}
